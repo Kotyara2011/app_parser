@@ -30,7 +30,8 @@ CONTACT_PATH_GUESSES = [
     "/about", "/company", "/rekvizity", "/requisites", "/support"
 ]
 
-PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{8,}\d")
+# только телефоны начинающиеся с +
+PHONE_RE = re.compile(r"\+\d[\d\s\-()]{8,}\d")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-.]+")
 INN_CANDIDATE_RE = re.compile(r"(?<!\d)(\d{10}|\d{12})(?!\d)")
 INN_NEAR_RE = re.compile(r"ИНН\s*[:№#\-]*\s*(\d{10}|\d{12})", re.IGNORECASE)
@@ -72,7 +73,6 @@ def looks_like_date(s: str) -> bool:
         return False
     if DATE_RE_SIMPLE.match(s):
         return True
-    # try pandas parse as fallback (catches many date formats)
     try:
         ts = pd.to_datetime(s, errors='coerce')
         return not pd.isna(ts)
@@ -81,11 +81,8 @@ def looks_like_date(s: str) -> bool:
 
 
 def normalize_domain(raw: object) -> Optional[str]:
-    """Пытаемся вытащить валидный домен из произвольного значения.
-    Возвращает None если ничего валидного не найдено."""
     if raw is None:
         return None
-    # if it's a pandas Timestamp or datetime, ignore
     if hasattr(raw, 'tzinfo') or isinstance(raw, (pd.Timestamp,)):
         return None
 
@@ -93,19 +90,16 @@ def normalize_domain(raw: object) -> Optional[str]:
     if not s:
         return None
 
-    # skip entries that look like dates or are just a semicolon
     if s == ';' or (';' in s and len(s.strip(';').strip()) == 0):
         return None
     if looks_like_date(s):
         return None
 
-    # split by common separators (comma, semicolon, whitespace)
     parts = re.split(r"[;,\s]+", s)
     for part in parts:
         token = part.strip().strip('"\'')
         if not token or token == ';':
             continue
-        # ignore tokens that look like emails
         if '@' in token:
             continue
         m = DOMAIN_LIKE_RE.match(token)
@@ -113,8 +107,6 @@ def normalize_domain(raw: object) -> Optional[str]:
         if m:
             host = m.group(1)
         else:
-            # maybe it's a raw host like example.com/ or example.com:8080
-            # try to parse as URL
             try:
                 p = urlparse.urlparse(token if token.startswith('http') else 'https://' + token)
                 if p.netloc:
@@ -124,11 +116,8 @@ def normalize_domain(raw: object) -> Optional[str]:
             except Exception:
                 host = None
         if host:
-            # strip port if present
             host = host.split('@')[-1].split(':')[0].lower()
-            # final sanity: must contain a dot and not be all-numeric
             if '.' in host and not host.replace('.', '').isdigit():
-                # remove leading www.
                 if host.startswith('www.'):
                     host = host[4:]
                 return f"https://{host}"
@@ -155,6 +144,8 @@ def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[str]:
 def clean_phone(p: str) -> str:
     s = re.sub(r"[^\d+]+", "", p)
     s = re.sub(r"^\++", "+", s)
+    if not s.startswith("+"):
+        return ""
     return s
 
 
@@ -167,7 +158,9 @@ def extract_contacts(html: str) -> Tuple[Set[str], Set[str], Set[str]]:
         emails.add(m.group(0).lower())
 
     for m in PHONE_RE.finditer(html):
-        phones.add(clean_phone(m.group(0)))
+        ph = clean_phone(m.group(0))
+        if ph:
+            phones.add(ph)
 
     for m in INN_NEAR_RE.finditer(html):
         cand = m.group(1)
@@ -278,7 +271,6 @@ uploaded = st.file_uploader("Загрузите Excel (.xlsx) или CSV (.csv)"
 if uploaded:
     try:
         if uploaded.name.lower().endswith('.csv'):
-            # try to autodetect delimiter
             try:
                 df_in = pd.read_csv(uploaded, sep=None, engine='python')
             except Exception:
@@ -292,16 +284,13 @@ if uploaded:
 
     st.success(f"Файл прочитан: {df_in.shape[0]} строк, {df_in.shape[1]} колонок")
 
-    # Попробуем найти подходящие колонки автоматически, но извлекать домены из всех ячеек
     domains_set: Set[str] = set()
     for col in df_in.columns:
         for val in df_in[col].dropna().astype(str).tolist():
-            # Extract possibly multiple domains from a cell
             d = normalize_domain(val)
             if d:
                 domains_set.add(d)
 
-    # Если не нашли, предложим вручную выбрать колонку
     if not domains_set:
         st.warning("Авто-детект доменов не дал результатов. Выберите колонку вручную.")
         col_choice = st.selectbox("Выберите колонку с доменами (или оставьте пустой)", options=[""] + list(df_in.columns))
@@ -323,7 +312,6 @@ if st.button("Запустить сбор", type="primary"):
     all_results: List[CrawlResult] = []
     records: List[Dict[str, object]] = []
 
-    # ---- добавляем пул потоков ----
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_dom = {
             executor.submit(crawl_domain, dom, max_pages=max_pages, timeout=int(timeout)): dom
@@ -365,7 +353,6 @@ if st.button("Запустить сбор", type="primary"):
         st.subheader("Найденные записи по страницам")
         st.dataframe(df_records, use_container_width=True)
 
-        # Save XLSX
         output_xlsx = io.BytesIO()
         with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
             df_summary.to_excel(writer, index=False, sheet_name="Сводка по доменам")
@@ -379,7 +366,6 @@ if st.button("Запустить сбор", type="primary"):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # Save CSVs into ZIP
         output_zip = io.BytesIO()
         with zipfile.ZipFile(output_zip, mode='w') as zf:
             zf.writestr('summary.csv', df_summary.to_csv(index=False, encoding='utf-8-sig'))
@@ -405,4 +391,5 @@ st.markdown("""
 - Если в ячейке несколько значений — строка разделяется по `,`, `;` и пробелам, и пытается извлечь домен из каждого токена.
 - Результат доступен в двух вариантах: `output.xlsx` (2 листа) и ZIP с двумя CSV: `summary.csv` и `records.csv`.
 - Убран прямой `global DEFAULT_TIMEOUT`: таймаут передаётся как параметр в обходщике.
+- ⚡️ Теперь в базу попадают только телефоны, начинающиеся с `+`.
 """)
