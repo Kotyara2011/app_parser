@@ -2,7 +2,6 @@ import re
 import io
 import time
 import queue
-import random
 import concurrent.futures
 import urllib.parse as urlparse
 from dataclasses import dataclass, field
@@ -22,12 +21,13 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.9"}
 DEFAULT_TIMEOUT = 15
 
 CONTACT_PATH_GUESSES = [
-    "/", "/contact", "/contacts", "/kontakty", "/kontact",
-    "/o-kompanii", "/about", "/company", "/rekvizity", "/requisites", "/support"
+    "/", "/contact", "/contacts", "/kontakty", "/kontact", "/o-kompanii",
+    "/about", "/company", "/rekvizity", "/requisites", "/support"
 ]
 
 PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{8,}\d")
@@ -36,9 +36,11 @@ INN_CANDIDATE_RE = re.compile(r"(?<!\d)(\d{10}|\d{12})(?!\d)")
 INN_NEAR_RE = re.compile(r"ИНН\s*[:№#\-]*\s*(\d{10}|\d{12})", re.IGNORECASE)
 
 # ---------- INN validation ----------
+
 def _checksum(digits: List[int], coeffs: List[int]) -> int:
     s = sum(d * c for d, c in zip(digits, coeffs))
     return (s % 11) % 10
+
 
 def validate_inn(inn: str) -> bool:
     if not inn.isdigit():
@@ -57,8 +59,10 @@ def validate_inn(inn: str) -> bool:
     return False
 
 # ---------- Helpers for domain normalization ----------
+
 DATE_RE_SIMPLE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DOMAIN_LIKE_RE = re.compile(r"^(?:https?://)?(?:www\.)?([A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63})+)(?:[:/].*)?$")
+
 
 def looks_like_date(s: str) -> bool:
     if not isinstance(s, str):
@@ -68,30 +72,40 @@ def looks_like_date(s: str) -> bool:
         return False
     if DATE_RE_SIMPLE.match(s):
         return True
+    # try pandas parse as fallback (catches many date formats)
     try:
         ts = pd.to_datetime(s, errors='coerce')
         return not pd.isna(ts)
     except Exception:
         return False
 
+
 def normalize_domain(raw: object) -> Optional[str]:
+    """Пытаемся вытащить валидный домен из произвольного значения.
+    Возвращает None если ничего валидного не найдено."""
     if raw is None:
         return None
+    # if it's a pandas Timestamp or datetime, ignore
     if hasattr(raw, 'tzinfo') or isinstance(raw, (pd.Timestamp,)):
         return None
+
     s = str(raw).strip()
     if not s:
         return None
+
+    # skip entries that look like dates or are just a semicolon
     if s == ';' or (';' in s and len(s.strip(';').strip()) == 0):
         return None
     if looks_like_date(s):
         return None
 
+    # split by common separators (comma, semicolon, whitespace)
     parts = re.split(r"[;,\s]+", s)
     for part in parts:
         token = part.strip().strip('"\'')
         if not token or token == ';':
             continue
+        # ignore tokens that look like emails
         if '@' in token:
             continue
         m = DOMAIN_LIKE_RE.match(token)
@@ -99,6 +113,8 @@ def normalize_domain(raw: object) -> Optional[str]:
         if m:
             host = m.group(1)
         else:
+            # maybe it's a raw host like example.com/ or example.com:8080
+            # try to parse as URL
             try:
                 p = urlparse.urlparse(token if token.startswith('http') else 'https://' + token)
                 if p.netloc:
@@ -108,57 +124,65 @@ def normalize_domain(raw: object) -> Optional[str]:
             except Exception:
                 host = None
         if host:
+            # strip port if present
             host = host.split('@')[-1].split(':')[0].lower()
+            # final sanity: must contain a dot and not be all-numeric
             if '.' in host and not host.replace('.', '').isdigit():
+                # remove leading www.
                 if host.startswith('www.'):
                     host = host[4:]
                 return f"https://{host}"
     return None
 
+
 def urljoin_keep(base: str, path: str) -> str:
     return urlparse.urljoin(base if base.endswith('/') else base + '/', path)
 
 # ---------- Fetching ----------
-def fetch(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 3, backoff: float = 1.5) -> Optional[str]:
-    """Загрузка страницы с повторами и бэкофом"""
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-            ct = r.headers.get('content-type', '')
-            if 200 <= r.status_code < 300 and ('text' in ct or 'html' in ct):
-                return r.text[:2_000_000]
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(backoff * (2 ** attempt) + random.random())
-                continue
-            return None
+
+def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[str]:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        ct = r.headers.get('content-type', '')
+        if r.status_code >= 200 and r.status_code < 300 and ('text' in ct or 'html' in ct):
+            return r.text[:2_000_000]
+    except Exception:
+        return None
     return None
 
 # ---------- Extraction ----------
+
 def clean_phone(p: str) -> str:
     s = re.sub(r"[^\d+]+", "", p)
     s = re.sub(r"^\++", "+", s)
     return s
 
+
 def extract_contacts(html: str) -> Tuple[Set[str], Set[str], Set[str]]:
     phones: Set[str] = set()
     emails: Set[str] = set()
     inns: Set[str] = set()
+
     for m in EMAIL_RE.finditer(html):
         emails.add(m.group(0).lower())
+
     for m in PHONE_RE.finditer(html):
         phones.add(clean_phone(m.group(0)))
+
     for m in INN_NEAR_RE.finditer(html):
         cand = m.group(1)
         if validate_inn(cand):
             inns.add(cand)
+
     for m in INN_CANDIDATE_RE.finditer(html):
         cand = m.group(1)
         if validate_inn(cand):
             inns.add(cand)
+
     return phones, emails, inns
 
 # ---------- Crawl per domain ----------
+
 @dataclass
 class CrawlResult:
     domain: str
@@ -179,6 +203,7 @@ class CrawlResult:
             "ИНН": ", ".join(sorted(agg_inns)) if agg_inns else "",
         }
 
+
 def same_host(url: str, base: str) -> bool:
     try:
         p1 = urlparse.urlparse(url)
@@ -187,9 +212,11 @@ def same_host(url: str, base: str) -> bool:
     except Exception:
         return False
 
+
 def crawl_domain(base: str, max_pages: int = 15, timeout: int = DEFAULT_TIMEOUT) -> CrawlResult:
     seen: Set[str] = set()
     q: "queue.Queue[str]" = queue.Queue()
+
     seeded = []
     for path in CONTACT_PATH_GUESSES:
         seeded.append(urljoin_keep(base, path))
@@ -197,14 +224,17 @@ def crawl_domain(base: str, max_pages: int = 15, timeout: int = DEFAULT_TIMEOUT)
         q.put(u)
 
     result = CrawlResult(domain=base)
+
     while not q.empty() and len(seen) < max_pages:
         url = q.get()
         if url in seen:
             continue
         seen.add(url)
+
         html = fetch(url, timeout=timeout)
         if not html:
             continue
+
         phones, emails, inns = extract_contacts(html)
         if phones or emails or inns:
             result.page_hits.append({
@@ -213,6 +243,7 @@ def crawl_domain(base: str, max_pages: int = 15, timeout: int = DEFAULT_TIMEOUT)
                 "emails": emails,
                 "inns": inns,
             })
+
         try:
             soup = BeautifulSoup(html, "html.parser")
             for a in soup.find_all("a", href=True):
@@ -223,25 +254,31 @@ def crawl_domain(base: str, max_pages: int = 15, timeout: int = DEFAULT_TIMEOUT)
                         q.put(new_url)
         except Exception:
             pass
+
     return result
 
 # ==========================
-# ---------- Streamlit UI --
+# ---------- Streamlit UI -
 # ==========================
 
 st.set_page_config(page_title="Парсер контактов по доменам", page_icon="📇", layout="wide")
+
 st.title("📇 Парсер контактов: Телефоны / Email / ИНН")
 st.write("Загрузите Excel (.xlsx) или CSV со списком доменов — приложение извлечёт только домены и обойдет сайт по ним, собирая телефоны, почты и ИНН.")
 
 with st.sidebar:
     st.header("Настройки")
-    max_pages = st.slider("Максимум страниц на домен", 5, 50, 15, step=1)
+    max_pages = st.slider("Максимум страниц на домен", 5, 50, 15, step=1,
+                          help="Лимит предотвращает долгий и агрессивный обход.")
     timeout = st.slider("Таймаут запроса (сек)", 5, 60, DEFAULT_TIMEOUT, step=1)
-    uploaded = st.file_uploader("Загрузите Excel (.xlsx) или CSV (.csv)", type=["xlsx", "csv"])
+    st.caption("*Приложение соблюдает вежливый режим: не выходит за пределы домена и читает только текстовые страницы.*")
+
+uploaded = st.file_uploader("Загрузите Excel (.xlsx) или CSV (.csv)", type=["xlsx", "csv"]) 
 
 if uploaded:
     try:
         if uploaded.name.lower().endswith('.csv'):
+            # try to autodetect delimiter
             try:
                 df_in = pd.read_csv(uploaded, sep=None, engine='python')
             except Exception:
@@ -255,16 +292,19 @@ if uploaded:
 
     st.success(f"Файл прочитан: {df_in.shape[0]} строк, {df_in.shape[1]} колонок")
 
+    # Попробуем найти подходящие колонки автоматически, но извлекать домены из всех ячеек
     domains_set: Set[str] = set()
     for col in df_in.columns:
         for val in df_in[col].dropna().astype(str).tolist():
+            # Extract possibly multiple domains from a cell
             d = normalize_domain(val)
             if d:
                 domains_set.add(d)
 
+    # Если не нашли, предложим вручную выбрать колонку
     if not domains_set:
         st.warning("Авто-детект доменов не дал результатов. Выберите колонку вручную.")
-        col_choice = st.selectbox("Выберите колонку с доменами", options=[""] + list(df_in.columns))
+        col_choice = st.selectbox("Выберите колонку с доменами (или оставьте пустой)", options=[""] + list(df_in.columns))
         if col_choice:
             for val in df_in[col_choice].dropna().astype(str).tolist():
                 d = normalize_domain(val)
@@ -276,42 +316,44 @@ if uploaded:
     if len(domains) > 0:
         st.write("Примеры доменов:", domains[:50])
 
-    BATCH_SIZE = 250
-    MAX_WORKERS = 25
+if st.button("Запустить сбор", type="primary"):
+    progress = st.progress(0)
+    status = st.empty()
 
-    if st.button("Запустить сбор", type="primary"):
-        progress = st.progress(0)
-        status = st.empty()
-        all_results: List[CrawlResult] = []
-        records: List[Dict[str, object]] = []
+    all_results: List[CrawlResult] = []
+    records: List[Dict[str, object]] = []
 
-        for batch_start in range(0, len(domains), BATCH_SIZE):
-            batch = domains[batch_start: batch_start + BATCH_SIZE]
-            status.write(f"⚡ Обрабатываю пачку {batch_start+1}–{batch_start+len(batch)} из {len(domains)} доменов")
+    # ---- добавляем пул потоков ----
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_dom = {
+            executor.submit(crawl_domain, dom, max_pages=max_pages, timeout=int(timeout)): dom
+            for dom in domains
+        }
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_dom = {
-                    executor.submit(crawl_domain, dom, max_pages=max_pages, timeout=int(timeout)): dom
-                    for dom in batch
-                }
-                for i, future in enumerate(concurrent.futures.as_completed(future_to_dom), start=1):
-                    dom = future_to_dom[future]
-                    try:
-                        res = future.result()
-                        all_results.append(res)
-                        for hit in res.page_hits:
-                            records.append({
-                                "Домен": dom,
-                                "URL": hit["url"],
-                                "Телефоны": ", ".join(sorted(hit["phones"])) if hit["phones"] else "",
-                                "Почты": ", ".join(sorted(hit["emails"])) if hit["emails"] else "",
-                                "ИНН": ", ".join(sorted(hit["inns"])) if hit["inns"] else "",
-                            })
-                    except Exception as e:
-                        records.append({"Домен": dom, "URL": "", "Телефоны": "", "Почты": "", "ИНН": f"Ошибка: {e}"})
-                    done = batch_start + i
-                    progress.progress(done / max(1, len(domains)))
-                    time.sleep(0.01)
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_dom), start=1):
+            dom = future_to_dom[future]
+            status.write(f"Обрабатываю {dom} ({i}/{len(domains)}) …")
+            try:
+                res = future.result()
+                all_results.append(res)
+                for hit in res.page_hits:
+                    records.append({
+                        "Домен": dom,
+                        "URL": hit["url"],
+                        "Телефоны": ", ".join(sorted(hit["phones"])) if hit["phones"] else "",
+                        "Почты": ", ".join(sorted(hit["emails"])) if hit["emails"] else "",
+                        "ИНН": ", ".join(sorted(hit["inns"])) if hit["inns"] else "",
+                    })
+            except Exception as e:
+                records.append({
+                    "Домен": dom,
+                    "URL": "",
+                    "Телефоны": "",
+                    "Почты": "",
+                    "ИНН": f"Ошибка: {e}",
+                })
+            progress.progress(i / max(1, len(domains)))
+            time.sleep(0.02)
 
         summary_rows = [r.aggregate() for r in all_results]
         df_summary = pd.DataFrame(summary_rows)
@@ -329,6 +371,7 @@ if uploaded:
             df_summary.to_excel(writer, index=False, sheet_name="Сводка по доменам")
             df_records.to_excel(writer, index=False, sheet_name="Найденные записи")
         output_xlsx.seek(0)
+
         st.download_button(
             label="💾 Скачать результат (output.xlsx)",
             data=output_xlsx,
@@ -342,12 +385,24 @@ if uploaded:
             zf.writestr('summary.csv', df_summary.to_csv(index=False, encoding='utf-8-sig'))
             zf.writestr('records.csv', df_records.to_csv(index=False, encoding='utf-8-sig'))
         output_zip.seek(0)
+
         st.download_button(
             label="💾 Скачать CSV (summary.csv + records.csv) в ZIP",
             data=output_zip,
             file_name="output_csvs.zip",
             mime="application/zip",
         )
+
         st.success("Готово! Можно скачать результат.")
 else:
     st.caption("Ожидаю загрузку файла (.xlsx или .csv)…")
+
+st.markdown("""
+---
+**Изменения и важные моменты:**
+- Поддержка входных файлов: XLSX и CSV.
+- Из ячеек извлекаются **только домены**: даты (напр. `2025-08-26`) и одиночные `;` **игнорируются**.
+- Если в ячейке несколько значений — строка разделяется по `,`, `;` и пробелам, и пытается извлечь домен из каждого токена.
+- Результат доступен в двух вариантах: `output.xlsx` (2 листа) и ZIP с двумя CSV: `summary.csv` и `records.csv`.
+- Убран прямой `global DEFAULT_TIMEOUT`: таймаут передаётся как параметр в обходщике.
+""")
